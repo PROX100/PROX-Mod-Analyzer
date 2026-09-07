@@ -1,724 +1,713 @@
-param(
+
     [string]$ModsPath = ""
 )
 
-$ErrorActionPreference = "Stop"
+$ErrorActionPreference = 'Continue'
 
 # ============================================================
-# PROX MOD ANALYZER
+# PROX MOD ANALYZER V6
+# Windows PowerShell 5.1 compatible
+# Static-only: analyzed JARs are never executed.
 # ============================================================
+
+$ScriptVersion = '6.0'
+$MaxArchiveEntryMB = 25
+$MaxNestedDepth = 2
+$WebTimeoutSeconds = 8
 
 function Show-Section {
     param([string]$Text)
-
     Write-Host ""
-    Write-Host ("=" * 58)
+    Write-Host '=========================================================='
     Write-Host $Text
-    Write-Host ("=" * 58)
+    Write-Host '=========================================================='
 }
 
 function Get-Hashes {
     param([string]$Path)
-
-    return [PSCustomObject]@{
+    [PSCustomObject]@{
         SHA256 = (Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash.ToLower()
         SHA1   = (Get-FileHash -LiteralPath $Path -Algorithm SHA1).Hash.ToLower()
     }
 }
 
+function Get-ZoneIdentifier {
+    param([string]$Path)
+    try {
+        $lines = Get-Content -LiteralPath $Path -Stream Zone.Identifier -ErrorAction Stop
+        foreach ($line in $lines) {
+            if ($line -like 'HostUrl=*') { return $line.Substring(8) }
+        }
+    } catch {}
+    return $null
+}
+
 function Get-ModrinthInfo {
     param([string]$Sha1)
-
     try {
-        $headers = @{
-            "User-Agent" = "PROX-Mod-Analyzer/1.0"
-        }
-
-        $version = Invoke-RestMethod `
-            -Uri "https://api.modrinth.com/v2/version_file/$Sha1" `
-            -Headers $headers `
-            -TimeoutSec 8
-
-        if (-not $version) {
-            return [PSCustomObject]@{ Found = $false }
-        }
+        $headers = @{ 'User-Agent' = "PROX-Mod-Analyzer/$ScriptVersion" }
+        $version = Invoke-RestMethod -Uri ("https://api.modrinth.com/v2/version_file/" + $Sha1) -Headers $headers -TimeoutSec $WebTimeoutSeconds
+        if ($null -eq $version) { return [PSCustomObject]@{Found=$false; Lookup='not_found'} }
 
         $project = $null
-
         if ($version.project_id) {
-            $project = Invoke-RestMethod `
-                -Uri "https://api.modrinth.com/v2/project/$($version.project_id)" `
-                -Headers $headers `
-                -TimeoutSec 8
+            $project = Invoke-RestMethod -Uri ("https://api.modrinth.com/v2/project/" + $version.project_id) -Headers $headers -TimeoutSec $WebTimeoutSeconds
+        }
+
+        $name = 'Unknown'
+        $slug = 'Unknown'
+        if ($project) {
+            if ($project.title) { $name = [string]$project.title }
+            if ($project.slug)  { $slug = [string]$project.slug }
         }
 
         return [PSCustomObject]@{
             Found     = $true
-            Name      = if ($project) { $project.title } else { "Unknown" }
-            Slug      = if ($project) { $project.slug } else { "Unknown" }
-            Version   = $version.version_number
-            ProjectID = $version.project_id
+            Lookup    = 'match'
+            Name      = $name
+            Slug      = $slug
+            Version   = [string]$version.version_number
+            ProjectID = [string]$version.project_id
         }
     }
     catch {
-        return [PSCustomObject]@{
-            Found = $false
-        }
+        return [PSCustomObject]@{Found=$false; Lookup='error'}
     }
 }
 
-function Get-ZoneIdentifier {
-    param([string]$Path)
-
+function Read-EntryBytes {
+    param($Entry)
+    $stream = $null
+    $memory = $null
     try {
-        $lines = Get-Content `
-            -LiteralPath $Path `
-            -Stream Zone.Identifier `
-            -ErrorAction Stop
-
-        $hostLine = $lines |
-            Where-Object { $_ -like "HostUrl=*" } |
-            Select-Object -First 1
-
-        if ($hostLine) {
-            return $hostLine.Substring(8)
-        }
+        $stream = $Entry.Open()
+        $memory = New-Object System.IO.MemoryStream
+        $stream.CopyTo($memory)
+        return $memory.ToArray()
     }
     catch {
+        return $null
+    }
+    finally {
+        if ($stream) { $stream.Dispose() }
+        if ($memory) { $memory.Dispose() }
+    }
+}
+
+function Read-EntryText {
+    param($Entry)
+    $bytes = Read-EntryBytes $Entry
+    if ($null -eq $bytes) { return '' }
+    try {
+        return [System.Text.Encoding]::UTF8.GetString($bytes)
+    } catch {
+        return ''
+    }
+}
+
+function Get-AsciiStrings {
+    param([byte[]]$Bytes)
+
+    $list = New-Object System.Collections.Generic.List[string]
+    if ($null -eq $Bytes) { return $list }
+
+    $sb = New-Object System.Text.StringBuilder
+
+    foreach ($b in $Bytes) {
+        if ($b -ge 32 -and $b -le 126) {
+            [void]$sb.Append([char]$b)
+        }
+        else {
+            if ($sb.Length -ge 4) { $list.Add($sb.ToString()) }
+            $sb.Clear() | Out-Null
+        }
     }
 
-    return $null
+    if ($sb.Length -ge 4) { $list.Add($sb.ToString()) }
+    return $list
 }
 
-# These are indicators only.
-# Their presence does NOT prove malware.
-$Rules = [ordered]@{
-
-    "Process execution" = @(
-        "java/lang/ProcessBuilder",
-        "Runtime.exec",
-        "ProcessBuilder.start"
+function Add-Evidence {
+    param(
+        $List,
+        [string]$Text,
+        [int]$Limit = 30
     )
+    if ($List.Count -lt $Limit -and $List -notcontains $Text) {
+        $List.Add($Text)
+    }
+}
 
-    "Network communication" = @(
-        "java/net/Socket",
-        "java/net/ServerSocket",
-        "java/net/HttpURLConnection",
-        "java/net/URLConnection",
-        "java/net/http/HttpClient",
-        "java/net/URL",
-        "okhttp",
-        "socket"
+# ============================================================
+# HIGH-CONFIDENCE CHEAT FEATURES
+# Generic words are intentionally excluded.
+# ============================================================
+
+$CheatFeatureGroups = [ordered]@{
+    'Combat automation' = @(
+        'AimAssist','Aimbot','TriggerBot','AutoClicker','AutoCrystal',
+        'AutoHitCrystal','AutoPot','AutoPotRefill','AutoWTap',
+        'AutoJumpReset','AutoInventoryTotem','AutoDoubleHand',
+        'AutoArmor','ShieldDisabler','ShieldBreaker','TotemOffhand',
+        'CrystalOptimizer','AnchorMacro','DoubleAnchor','NoMissDelay',
+        'KillAura','TargetStrafe','Reach','Hitboxes','Velocity','Criticals'
     )
-
-    "Command shell" = @(
-        "cmd.exe",
-        "/bin/sh",
-        "/bin/bash",
-        "powershell.exe",
-        "pwsh"
+    'Movement manipulation' = @(
+        'PingSpoof','FakeLag','PacketSpoof','PacketFly','Freecam',
+        'NoJumpDelay','NoBreakDelay','NoSlow','Scaffold','TimerHack',
+        'Flight','Jesus','LongJump','SpeedHack','NoFall'
     )
-
-    "PowerShell / web execution" = @(
-        "Invoke-WebRequest",
-        "Invoke-RestMethod",
-        "DownloadString",
-        "DownloadFile",
-        "powershell -enc",
-        "powershell -encodedcommand",
-        "Invoke-Expression"
+    'Targeting / visual cheats' = @(
+        'PlayerESP','StorageESP','ItemESP','EntityESP','ChestESP',
+        'TargetESP','Tracers','FullBrightHack','Xray','NameTags'
     )
-
-    "File-system access" = @(
-        "java/io/File",
-        "java/nio/file",
-        "FileOutputStream",
-        "FileInputStream"
-    )
-
-    "Reflection" = @(
-        "java/lang/reflect",
-        "Class.forName",
-        "getDeclaredMethod",
-        "getDeclaredField",
-        "setAccessible"
+    'Anti-analysis / concealment' = @(
+        'SelfDestruct','EncryptedString','DecryptString','AntiDebug',
+        'AntiDump','MemoryScanner','HWID','HWIDCheck'
     )
 }
 
-$HighRisk = @(
-    "VirtualAlloc",
-    "CreateRemoteThread",
-    "WriteProcessMemory",
-    "OpenProcess",
-    "NtWriteVirtualMemory",
-    "powershell -enc",
-    "powershell -encodedcommand",
-    "Invoke-Expression"
+$StrongCheatClassTokens = @(
+    'AimAssist','Aimbot','TriggerBot','AutoClicker','AutoCrystal',
+    'AutoHitCrystal','AutoPot','AutoWTap','AutoInventoryTotem',
+    'AutoDoubleHand','AutoArmor','ShieldDisabler','ShieldBreaker',
+    'TotemOffhand','CrystalOptimizer','AnchorMacro','DoubleAnchor',
+    'PingSpoof','FakeLag','PacketSpoof','PacketFly','Freecam',
+    'NoJumpDelay','NoBreakDelay','NoSlow','Scaffold','TimerHack',
+    'Flight','Jesus','LongJump','SpeedHack','NoFall','KillAura',
+    'TargetStrafe','Reach','Velocity','Criticals','PlayerESP',
+    'StorageESP','ItemESP','EntityESP','ChestESP','TargetESP',
+    'Tracers','Xray','SelfDestruct','AntiDebug','AntiDump'
+)
+
+# High-value architecture clues when correlated with cheat features.
+$FrameworkTokens = @(
+    'ModuleManager','EventManager','RotationManager','RotatorManager',
+    'RotationUtils','MouseSimulation','PacketSendListener',
+    'PacketReceiveListener','MovementPacketListener','TargetManager'
+)
+
+$HighRiskTokens = @(
+    'VirtualAlloc','VirtualProtect','CreateRemoteThread',
+    'WriteProcessMemory','ReadProcessMemory','OpenProcess',
+    'NtWriteVirtualMemory','JNI_OnLoad','Invoke-Expression',
+    'DownloadString','DownloadFile','powershell.exe','cmd.exe'
+)
+
+# API names alone are informational. They only score when correlated with stronger evidence.
+$CapabilityTokens = @(
+    'java/net/Socket','java/net/ServerSocket','java/net/URL',
+    'java/net/HttpURLConnection','java/net/http/HttpClient',
+    'java/lang/ProcessBuilder','Runtime.exec','java/lang/reflect',
+    'java/io/File','java/nio/file'
+)
+
+# Things that are common in normal mods and should NOT score as cheats by themselves.
+$IgnoreTerms = @(
+    'ESP','HUD','Module','Modules','KeyBind','KeyBinding','Sprint',
+    'Packet','Mouse','Keyboard','Client','Network','Reflection',
+    'URL','File','Render','Target','Inventory','Mixin'
 )
 
 # ============================================================
-# FIND MODS FOLDER
+# PATH
 # ============================================================
 
-if (-not $ModsPath) {
-
-    $defaultModsPath = Join-Path $env:APPDATA ".minecraft\mods"
-
-    $ModsPath = Read-Host "Mods folder [$defaultModsPath]"
-
-    if ([string]::IsNullOrWhiteSpace($ModsPath)) {
-        $ModsPath = $defaultModsPath
-    }
+if ([string]::IsNullOrWhiteSpace($ModsPath)) {
+    $defaultPath = Join-Path $env:APPDATA '.minecraft\mods'
+    $ModsPath = Read-Host "Mods folder [$defaultPath]"
+    if ([string]::IsNullOrWhiteSpace($ModsPath)) { $ModsPath = $defaultPath }
 }
 
 $ModsPath = [Environment]::ExpandEnvironmentVariables($ModsPath)
 
 if (-not (Test-Path -LiteralPath $ModsPath -PathType Container)) {
-
-    Write-Host ""
-    Write-Host "[!] Folder does not exist:" -ForegroundColor Red
-    Write-Host "    $ModsPath"
-
+    Write-Host "[!] Folder does not exist: $ModsPath" -ForegroundColor Red
     exit 1
 }
 
-$jars = @(
-    Get-ChildItem `
-        -LiteralPath $ModsPath `
-        -Filter "*.jar" `
-        -File
-)
+$jars = @(Get-ChildItem -LiteralPath $ModsPath -Filter '*.jar' -File)
 
 Clear-Host
-
-Show-Section "PROX MOD ANALYZER"
-
+Show-Section "PROX MOD ANALYZER V$ScriptVersion"
 Write-Host "Folder: $ModsPath"
 Write-Host "Mods found: $($jars.Count)"
 
 if ($jars.Count -eq 0) {
-
-    Write-Host ""
-    Write-Host "[!] No JAR files found." -ForegroundColor Yellow
-
+    Write-Host '[!] No JAR files found.' -ForegroundColor Yellow
     exit 0
 }
 
 # ============================================================
-# RESULT STORAGE
+# RESULT GROUPS
 # ============================================================
 
-$verifiedMods = New-Object System.Collections.Generic.List[object]
-$reviewMods = New-Object System.Collections.Generic.List[object]
-$suspiciousMods = New-Object System.Collections.Generic.List[object]
-$highRiskMods = New-Object System.Collections.Generic.List[object]
-$unknownMods = New-Object System.Collections.Generic.List[object]
+$verified = New-Object System.Collections.Generic.List[object]
+$low      = New-Object System.Collections.Generic.List[object]
+$review   = New-Object System.Collections.Generic.List[object]
+$susp     = New-Object System.Collections.Generic.List[object]
+$high     = New-Object System.Collections.Generic.List[object]
+$unknown  = New-Object System.Collections.Generic.List[object]
 
 # ============================================================
-# ANALYZE EACH MOD
+# ANALYSIS
 # ============================================================
 
 foreach ($jar in $jars) {
 
+    $zip = $null
+
     try {
-
         $hashes = Get-Hashes $jar.FullName
+        $mr = Get-ModrinthInfo $hashes.SHA1
+        $origin = Get-ZoneIdentifier $jar.FullName
 
-        $modrinth = Get-ModrinthInfo $hashes.SHA1
+        Add-Type -AssemblyName System.IO.Compression.FileSystem -ErrorAction SilentlyContinue
+        $zip = [System.IO.Compression.ZipFile]::OpenRead($jar.FullName)
+        $entries = @($zip.Entries)
 
         $score = 0
-
         $reasons = New-Object System.Collections.Generic.List[string]
+        $evidence = New-Object System.Collections.Generic.List[string]
+        $featureEvidence = @{}
+        $frameworkEvidence = New-Object System.Collections.Generic.List[string]
+        $highRiskEvidence = New-Object System.Collections.Generic.List[string]
 
-        $found = @{}
-
-        $highHits = @{}
-
-        $classCount = 0
-        $shortClassCount = 0
-
-        # --------------------------------------------------------
-        # OPEN JAR
-        # --------------------------------------------------------
-
-        Add-Type -AssemblyName System.IO.Compression.FileSystem
-
-        $zip = [IO.Compression.ZipFile]::OpenRead($jar.FullName)
-
-        # --------------------------------------------------------
-        # COUNT CLASSES
-        # --------------------------------------------------------
-
-        $classes = @(
-            $zip.Entries |
-            Where-Object {
-                $_.FullName -match "\.class$"
-            }
-        )
-
-        $classCount = $classes.Count
-
-        if ($classCount -gt 0) {
-
-            foreach ($class in $classes) {
-
-                $className = $class.FullName -replace "\.class$", ""
-
-                $simpleName = ($className -split "/")[-1]
-
-                if ($simpleName.Length -le 2) {
-                    $shortClassCount++
-                }
-            }
-
-            $ratio = $shortClassCount / $classCount
-
-            if ($ratio -ge 0.20) {
-
-                $score += 7
-
-                $reasons.Add(
-                    "High proportion of short class names"
-                )
-            }
+        foreach ($group in $CheatFeatureGroups.Keys) {
+            $featureEvidence[$group] = New-Object System.Collections.Generic.List[string]
         }
 
         # --------------------------------------------------------
-        # SCAN FILE CONTENT
+        # Metadata
         # --------------------------------------------------------
 
-        foreach ($entry in $zip.Entries) {
+        $declaredId = ''
+        $declaredName = ''
+        $declaredVersion = ''
+        $entrypoints = New-Object System.Collections.Generic.List[string]
+        $mixins = New-Object System.Collections.Generic.List[string]
 
-            if ($entry.FullName.EndsWith("/")) {
-                continue
-            }
+        foreach ($metadataName in @('fabric.mod.json','quilt.mod.json')) {
+            $metaEntry = $zip.GetEntry($metadataName)
+            if ($metaEntry) {
+                try {
+                    $meta = (Read-EntryText $metaEntry) | ConvertFrom-Json
 
-            # Skip huge files.
-            if ($entry.Length -gt 10MB) {
-                continue
-            }
+                    if ($meta.id) { $declaredId = [string]$meta.id }
+                    if ($meta.name) { $declaredName = [string]$meta.name }
+                    if ($meta.version) { $declaredVersion = [string]$meta.version }
 
-            try {
-
-                $reader = New-Object IO.StreamReader(
-                    $entry.Open(),
-                    [Text.Encoding]::UTF8,
-                    $true
-                )
-
-                $text = $reader.ReadToEnd()
-
-                $reader.Dispose()
-
-                # --------------------------------------------
-                # NORMAL INDICATORS
-                # --------------------------------------------
-
-                foreach ($category in $Rules.Keys) {
-
-                    foreach ($indicator in $Rules[$category]) {
-
-                        if (
-                            $text.IndexOf(
-                                $indicator,
-                                [StringComparison]::OrdinalIgnoreCase
-                            ) -ge 0
-                        ) {
-
-                            if (-not $found.ContainsKey($category)) {
-                                $found[$category] = @()
-                            }
-
-                            if ($found[$category].Count -lt 8) {
-
-                                $found[$category] +=
-                                    "$indicator -> $($entry.FullName)"
+                    if ($meta.entrypoints) {
+                        foreach ($prop in $meta.entrypoints.PSObject.Properties) {
+                            foreach ($value in @($prop.Value)) {
+                                if ($value -is [string]) {
+                                    $entrypoints.Add([string]$value)
+                                }
+                                elseif ($value.value) {
+                                    $entrypoints.Add([string]$value.value)
+                                }
                             }
                         }
                     }
-                }
 
-                # --------------------------------------------
-                # HIGH-RISK INDICATORS
-                # --------------------------------------------
-
-                foreach ($indicator in $HighRisk) {
-
-                    if (
-                        $text.IndexOf(
-                            $indicator,
-                            [StringComparison]::OrdinalIgnoreCase
-                        ) -ge 0
-                    ) {
-
-                        $highHits[
-                            "$indicator -> $($entry.FullName)"
-                        ] = 1
+                    if ($meta.mixins) {
+                        foreach ($mixin in @($meta.mixins)) {
+                            if ($mixin) { $mixins.Add([string]$mixin) }
+                        }
                     }
                 }
-
-            }
-            catch {
-                # Ignore unreadable entries.
+                catch {}
+                break
             }
         }
 
-        $zip.Dispose()
+        # --------------------------------------------------------
+        # Archive facts
+        # --------------------------------------------------------
 
-        # ========================================================
-        # SCORE
-        # ========================================================
+        $classPaths = @(
+            $entries |
+            Where-Object { $_.FullName -match '\.class$' } |
+            ForEach-Object { [string]$_.FullName }
+        )
 
-        if ($found.ContainsKey("Process execution")) {
+        $classCount = $classPaths.Count
+        $nestedJars = @(
+            $entries |
+            Where-Object { $_.FullName -match '\.jar$' }
+        )
 
-            $score += 10
-            $reasons.Add("Process execution capability")
+        # --------------------------------------------------------
+        # Obfuscation / naming signal
+        # --------------------------------------------------------
+
+        $shortCount = 0
+        foreach ($path in $classPaths) {
+            $simple = ([System.IO.Path]::GetFileNameWithoutExtension($path))
+            if ($simple.Length -le 2) { $shortCount++ }
         }
 
-        if ($found.ContainsKey("Network communication")) {
+        $shortRatio = 0
+        if ($classCount -gt 0) { $shortRatio = $shortCount / $classCount }
 
+        if ($classCount -gt 10 -and $shortRatio -ge 0.35) {
             $score += 5
-            $reasons.Add("Network communication capability")
+            $reasons.Add('Strong class-name obfuscation signal')
+            Add-Evidence $evidence ("Short classes: $shortCount/$classCount ($([math]::Round($shortRatio * 100,1))%)")
         }
 
-        if ($found.ContainsKey("Command shell")) {
+        # --------------------------------------------------------
+        # Scan metadata/mixin JSON as text
+        # --------------------------------------------------------
 
-            $score += 15
-            $reasons.Add("Command shell capability")
-        }
+        foreach ($entry in $entries) {
+            if ($entry.FullName.EndsWith('/')) { continue }
+            if ($entry.Length -gt ($MaxArchiveEntryMB * 1MB)) { continue }
 
-        if ($found.ContainsKey("PowerShell / web execution")) {
-
-            $score += 20
-            $reasons.Add(
-                "PowerShell/web execution indicator"
+            $nameLower = $entry.FullName.ToLowerInvariant()
+            $shouldScanText = (
+                $nameLower -match '(fabric\.mod\.json|quilt\.mod\.json|mixins?\.json|\.properties$|\.toml$)' -or
+                $nameLower -match '\.class$'
             )
-        }
 
-        if ($found.ContainsKey("File-system access")) {
+            if (-not $shouldScanText) { continue }
 
-            $score += 3
-            $reasons.Add("File-system API usage")
-        }
+            $bytes = Read-EntryBytes $entry
+            if ($null -eq $bytes) { continue }
 
-        if ($found.ContainsKey("Reflection")) {
+            $ascii = Get-AsciiStrings $bytes
 
-            $score += 2
-            $reasons.Add("Reflection API usage")
-        }
-
-        if ($highHits.Count -gt 0) {
-
-            foreach ($hit in $highHits.Keys) {
-                $score += 15
+            foreach ($term in $HighRiskTokens) {
+                foreach ($s in $ascii) {
+                    if ($s.IndexOf($term,[StringComparison]::OrdinalIgnoreCase) -ge 0) {
+                        Add-Evidence $highRiskEvidence "$term -> $($entry.FullName)" 20
+                        break
+                    }
+                }
             }
 
-            $reasons.Add(
-                "High-risk execution indicator(s)"
-            )
+            # Do not use generic capability tokens for scoring here.
+            # They are collected only when a stronger cheat fingerprint exists.
+            foreach ($group in $CheatFeatureGroups.Keys) {
+                foreach ($term in $CheatFeatureGroups[$group]) {
+                    foreach ($s in $ascii) {
+                        if ($s.IndexOf($term,[StringComparison]::OrdinalIgnoreCase) -ge 0) {
+                            Add-Evidence $featureEvidence[$group] "$term -> $($entry.FullName)" 15
+                            break
+                        }
+                    }
+                }
+            }
+
+            foreach ($term in $FrameworkTokens) {
+                foreach ($s in $ascii) {
+                    if ($s.IndexOf($term,[StringComparison]::OrdinalIgnoreCase) -ge 0) {
+                        Add-Evidence $frameworkEvidence "$term -> $($entry.FullName)" 20
+                        break
+                    }
+                }
+            }
         }
 
-        $score = [Math]::Min(100, $score)
+        # --------------------------------------------------------
+        # Class-path analysis
+        # This is intentionally stronger than searching resource text.
+        # --------------------------------------------------------
 
-        # ========================================================
-        # VERDICT
-        # ========================================================
+        foreach ($path in $classPaths) {
 
-        if ($score -le 10) {
-            $verdict = "LOW RISK"
+            $simpleClass = [System.IO.Path]::GetFileNameWithoutExtension($path)
+
+            foreach ($group in $CheatFeatureGroups.Keys) {
+                foreach ($term in $StrongCheatClassTokens) {
+                    if ($simpleClass.IndexOf($term,[StringComparison]::OrdinalIgnoreCase) -ge 0) {
+                        Add-Evidence $featureEvidence[$group] "CLASS: $path" 15
+                    }
+                }
+            }
+
+            foreach ($term in $FrameworkTokens) {
+                if ($simpleClass.IndexOf($term,[StringComparison]::OrdinalIgnoreCase) -ge 0) {
+                    Add-Evidence $frameworkEvidence "CLASS: $path" 20
+                }
+            }
         }
-        elseif ($score -le 25) {
-            $verdict = "REVIEW"
+
+        # --------------------------------------------------------
+        # Detect module/category style package architecture.
+        # This only counts when strong cheat features are already present.
+        # --------------------------------------------------------
+
+        $modulePathCount = @(
+            $classPaths |
+            Where-Object {
+                $_ -match '(?i)(^|/)module(/|/modules/)' -or
+                $_ -match '(?i)/modules/(combat|movement|misc|render|player)/'
+            }
+        ).Count
+
+        $cheatCategoryCount = 0
+        foreach ($group in $featureEvidence.Keys) {
+            if ($featureEvidence[$group].Count -gt 0) {
+                $cheatCategoryCount++
+            }
         }
-        elseif ($score -le 45) {
-            $verdict = "SUSPICIOUS"
+
+        # Strong feature-category scoring.
+        if ($cheatCategoryCount -ge 3) {
+            $score += 55
+            $reasons.Add('Multiple independent cheat-feature categories')
+        }
+        elseif ($cheatCategoryCount -eq 2) {
+            $score += 35
+            $reasons.Add('Multiple cheat-feature categories')
+        }
+        elseif ($cheatCategoryCount -eq 1) {
+            $score += 15
+            $reasons.Add('Specific cheat-feature indicators')
+        }
+
+        # A dedicated module architecture makes a collection of cheat features stronger.
+        if ($modulePathCount -ge 5 -and $cheatCategoryCount -ge 1) {
+            $score += 10
+            $reasons.Add('Cheat-style module architecture')
+            Add-Evidence $evidence "Module-style class paths: $modulePathCount"
+        }
+
+        # Framework clues only matter when paired with a cheat category.
+        if ($frameworkEvidence.Count -ge 2 -and $cheatCategoryCount -ge 1) {
+            $score += 10
+            $reasons.Add('Cheat-client framework indicators')
+            foreach ($x in $frameworkEvidence | Select-Object -First 8) {
+                Add-Evidence $evidence $x
+            }
+        }
+
+        # High-risk execution/network indicators are supplemental.
+        if ($highRiskEvidence.Count -gt 0) {
+            $score += 25
+            $reasons.Add('High-risk execution indicator(s)')
+            foreach ($x in $highRiskEvidence | Select-Object -First 10) {
+                Add-Evidence $evidence $x
+            }
+        }
+
+        # --------------------------------------------------------
+        # Metadata / code identity checks
+        # Conservative: only strong mismatch patterns score.
+        # --------------------------------------------------------
+
+        $topPackages = @()
+        foreach ($path in $classPaths) {
+            if ($path -match '^([^/]+/[^/]+)/') {
+                $topPackages += $Matches[1]
+            }
+        }
+        $topPackages = @($topPackages | Select-Object -Unique)
+
+        # Suspicious only when the declared identity says one thing but an entrypoint
+        # clearly says a cheat/client identity.
+        if ($entrypoints.Count -gt 0) {
+            foreach ($ep in $entrypoints) {
+                if ($ep -match '(?i)argon|cheat|hack|ghostclient|clickgui') {
+                    $score += 30
+                    $reasons.Add('Suspicious client/cheat entrypoint')
+                    Add-Evidence $evidence "Entrypoint: $ep"
+                }
+            }
+        }
+
+        # Argon-specific family fingerprint from the supplied sample.
+        $argonPaths = @(
+            $classPaths |
+            Where-Object { $_ -match '(?i)(^|/)dev/lvstrng/argon/' }
+        )
+
+        if ($argonPaths.Count -ge 2) {
+            $score += 70
+            $reasons.Add('Argon-family namespace detected')
+            Add-Evidence $evidence "Argon namespace classes: $($argonPaths.Count)"
+        }
+
+        # Mixin surface: only meaningful when focused on client input/network hooks AND cheat features.
+        $interestingMixins = @(
+            $mixins |
+            Where-Object {
+                $_ -match '(?i)mouse|keyboard|connection|player|camera|interaction|packet'
+            }
+        )
+
+        if ($interestingMixins.Count -ge 4 -and $cheatCategoryCount -ge 1) {
+            $score += 10
+            $reasons.Add('Cheat-relevant client mixin surface')
+            foreach ($m in $interestingMixins | Select-Object -First 8) {
+                Add-Evidence $evidence "Mixin: $m"
+            }
+        }
+
+        # Nested jars are evidence only, not risk by themselves.
+        if ($nestedJars.Count -gt 0) {
+            Add-Evidence $evidence "Embedded JARs: $($nestedJars.Count)"
+        }
+
+        # --------------------------------------------------------
+        # Reputation handling
+        # --------------------------------------------------------
+
+        $score = [Math]::Min(100,[Math]::Max(0,$score))
+
+        # Exact Modrinth match identifies the exact bytes. It does not erase behavior evidence.
+        if ($score -ge 75) {
+            $verdict = 'HIGH RISK'
+        }
+        elseif ($score -ge 45) {
+            $verdict = 'SUSPICIOUS'
+        }
+        elseif ($score -ge 20) {
+            $verdict = 'REVIEW'
         }
         else {
-            $verdict = "HIGH RISK"
+            $verdict = 'LOW RISK'
         }
 
-        # ========================================================
-        # CLASSIFY MOD
-        # ========================================================
+        if ($mr.Found -and $score -eq 0) {
+            $verdict = 'VERIFIED'
+        }
+        elseif ($mr.Found -and $score -lt 10) {
+            $verdict = 'VERIFIED'
+        }
 
-        $modName = $jar.BaseName
-
-        if ($modrinth.Found) {
-            $modName = $modrinth.Name
+        $displayName = $jar.BaseName
+        if ($mr.Found -and $mr.Name -ne 'Unknown') {
+            $displayName = $mr.Name
+        }
+        elseif ($declaredName) {
+            $displayName = $declaredName
         }
 
         $result = [PSCustomObject]@{
-            Name     = $modName
-            File     = $jar.Name
-            SHA256   = $hashes.SHA256
-            SHA1     = $hashes.SHA1
-            Score    = $score
-            Verdict  = $verdict
-            Reasons  = $reasons
-            HighHits = $highHits.Keys
-            Modrinth = $modrinth
-            Origin   = Get-ZoneIdentifier $jar.FullName
+            Name       = $displayName
+            File       = $jar.Name
+            SHA256     = $hashes.SHA256
+            SHA1       = $hashes.SHA1
+            Score      = $score
+            Verdict    = $verdict
+            Reasons    = $reasons
+            Evidence   = $evidence
+            Modrinth   = $mr
+            Origin     = $origin
+            ClassCount = $classCount
         }
 
-        # Exact Modrinth hash match is considered verified
-        # only when no suspicious static indicators were found.
-        if (
-            $modrinth.Found -and
-            $score -le 10
-        ) {
-
-            $verifiedMods.Add($result)
+        if ($verdict -eq 'VERIFIED') {
+            $verified.Add($result)
         }
-        elseif ($score -le 25) {
-
-            $reviewMods.Add($result)
+        elseif ($score -lt 20) {
+            $low.Add($result)
         }
-        elseif ($score -le 45) {
-
-            $suspiciousMods.Add($result)
+        elseif ($score -lt 45) {
+            $review.Add($result)
+        }
+        elseif ($score -lt 75) {
+            $susp.Add($result)
         }
         else {
-
-            $highRiskMods.Add($result)
+            $high.Add($result)
         }
-
     }
     catch {
-
-        $unknownMods.Add(
+        $unknown.Add(
             [PSCustomObject]@{
-                Name = $jar.BaseName
-                File = $jar.Name
+                Name  = $jar.BaseName
+                File  = $jar.Name
                 Error = $_.Exception.Message
             }
         )
     }
+    finally {
+        if ($zip) { $zip.Dispose() }
+    }
 }
 
 # ============================================================
-# COMPACT RESULTS
+# HABIBI-STYLE COMPACT OUTPUT
 # ============================================================
 
 Clear-Host
-
-Show-Section "PROX MOD ANALYZER"
-
+Show-Section "PROX MOD ANALYZER V$ScriptVersion"
 Write-Host "Folder: $ModsPath"
 Write-Host "Mods found: $($jars.Count)"
 
-# ============================================================
-# VERIFIED
-# ============================================================
+function Print-CompactGroup {
+    param(
+        [string]$Title,
+        $Items,
+        [ConsoleColor]$Color,
+        [bool]$ShowFile,
+        [bool]$ShowScore
+    )
 
-Write-Host ""
-Write-Host "{ Verified Mods }" -ForegroundColor Green
+    Write-Host ""
+    Write-Host "{ $Title }" -ForegroundColor $Color
 
-if ($verifiedMods.Count -eq 0) {
+    if ($Items.Count -eq 0) {
+        Write-Host "> None"
+        return
+    }
 
-    Write-Host "> None"
-}
-else {
+    foreach ($item in $Items) {
+        $line = "> " + $item.Name
 
-    foreach ($mod in $verifiedMods) {
+        if ($ShowFile) {
+            $line += "  " + $item.File
+        }
 
-        Write-Host (
-            "> " +
-            $mod.Name.PadRight(30) +
-            $mod.File
-        )
+        if ($ShowScore) {
+            $line += "  [$($item.Score)/100]"
+        }
+
+        Write-Host $line
     }
 }
 
-# ============================================================
-# REVIEW
-# ============================================================
+# Keep normal output extremely short.
+Print-CompactGroup "Verified Mods" $verified Green $true $false
+Print-CompactGroup "Low Risk" $low Gray $true $true
+Print-CompactGroup "Review" $review Yellow $true $true
+Print-CompactGroup "Suspicious" $susp DarkYellow $true $true
+Print-CompactGroup "High Risk" $high Red $true $true
+Print-CompactGroup "Unknown" $unknown Magenta $true $false
 
-Write-Host ""
-Write-Host "{ Review }" -ForegroundColor Yellow
+# One-line reason for flagged mods only.
+$flagged = @()
+foreach ($item in $review) { $flagged += $item }
+foreach ($item in $susp)   { $flagged += $item }
+foreach ($item in $high)   { $flagged += $item }
 
-if ($reviewMods.Count -eq 0) {
+if ($flagged.Count -gt 0) {
+    Write-Host ""
+    Write-Host "{ Flags }" -ForegroundColor Yellow
 
-    Write-Host "> None"
-}
-else {
+    foreach ($item in $flagged) {
+        $reasonText = "static indicators detected"
 
-    foreach ($mod in $reviewMods) {
+        if ($item.Reasons.Count -gt 0) {
+            $reasonText = (($item.Reasons | Select-Object -Unique) -join ", ")
+        }
 
-        Write-Host (
-            "> " +
-            $mod.Name.PadRight(30) +
-            "$($mod.File)  [$($mod.Score)/100]"
-        )
+        Write-Host ("> " + $item.Name + "  -  " + $reasonText)
     }
 }
 
-# ============================================================
-# SUSPICIOUS
-# ============================================================
+Write-Host ""
+Write-Host "{ Summary }"
+Write-Host "> Total:      $($jars.Count)"
+Write-Host "> Verified:   $($verified.Count)"
+Write-Host "> Low Risk:   $($low.Count)"
+Write-Host "> Review:     $($review.Count)"
+Write-Host "> Suspicious: $($susp.Count)"
+Write-Host "> High Risk:  $($high.Count)"
+Write-Host "> Unknown:    $($unknown.Count)"
 
 Write-Host ""
-Write-Host "{ Suspicious }" -ForegroundColor DarkYellow
-
-if ($suspiciousMods.Count -eq 0) {
-
-    Write-Host "> None"
-}
-else {
-
-    foreach ($mod in $suspiciousMods) {
-
-        Write-Host (
-            "> " +
-            $mod.Name.PadRight(30) +
-            "$($mod.File)  [$($mod.Score)/100]"
-        )
-    }
-}
-
-# ============================================================
-# HIGH RISK
-# ============================================================
-
-Write-Host ""
-Write-Host "{ High Risk }" -ForegroundColor Red
-
-if ($highRiskMods.Count -eq 0) {
-
-    Write-Host "> None"
-}
-else {
-
-    foreach ($mod in $highRiskMods) {
-
-        Write-Host (
-            "> " +
-            $mod.Name.PadRight(30) +
-            "$($mod.File)  [$($mod.Score)/100]"
-        )
-    }
-}
-
-# ============================================================
-# UNKNOWN
-# ============================================================
-
-Write-Host ""
-Write-Host "{ Unknown }" -ForegroundColor Magenta
-
-if ($unknownMods.Count -eq 0) {
-
-    Write-Host "> None"
-}
-else {
-
-    foreach ($mod in $unknownMods) {
-
-        Write-Host (
-            "> " +
-            $mod.Name.PadRight(30) +
-            $mod.File
-        )
-    }
-}
-
-# ============================================================
-# DETAILS FOR NON-VERIFIED MODS
-# ============================================================
-
-$needsDetails = @(
-    $reviewMods
-    $suspiciousMods
-    $highRiskMods
-    $unknownMods
-)
-
-if ($needsDetails.Count -gt 0) {
-
-    Show-Section "DETAILS"
-
-    foreach ($mod in $needsDetails) {
-
-        if (-not $mod.Score -and $unknownMods -contains $mod) {
-
-            Write-Host ""
-            Write-Host $mod.File -ForegroundColor Magenta
-            Write-Host "    [!] Analysis failed"
-            Write-Host "        $($mod.Error)"
-
-            continue
-        }
-
-        Write-Host ""
-        Write-Host $mod.File -ForegroundColor Yellow
-
-        Write-Host "    Score:   $($mod.Score)/100"
-        Write-Host "    Verdict: $($mod.Verdict)"
-
-        if ($mod.Reasons.Count -gt 0) {
-
-            Write-Host "    Reasons:"
-
-            $mod.Reasons |
-                Select-Object -Unique |
-                ForEach-Object {
-                    Write-Host "        - $_"
-                }
-        }
-
-        if ($mod.HighHits.Count -gt 0) {
-
-            Write-Host "    High-risk indicators:"
-
-            foreach ($hit in $mod.HighHits) {
-
-                Write-Host "        [!!!] $hit" `
-                    -ForegroundColor Red
-            }
-        }
-
-        Write-Host "    SHA-256: $($mod.SHA256)"
-        Write-Host "    SHA-1:   $($mod.SHA1)"
-
-        if ($mod.Modrinth.Found) {
-
-            Write-Host ""
-            Write-Host "    Modrinth:"
-            Write-Host "        Project: $($mod.Modrinth.Name)"
-            Write-Host "        Version: $($mod.Modrinth.Version)"
-        }
-        else {
-
-            Write-Host ""
-            Write-Host "    Modrinth:"
-            Write-Host "        No exact SHA-1 match found."
-        }
-
-        if ($mod.Origin) {
-
-            Write-Host ""
-            Write-Host "    Origin:"
-            Write-Host "        $($mod.Origin)"
-        }
-    }
-}
-
-# ============================================================
-# FINAL SUMMARY
-# ============================================================
-
-Show-Section "SUMMARY"
-
-Write-Host "Total:       $($jars.Count)"
-Write-Host "Verified:    $($verifiedMods.Count)" -ForegroundColor Green
-Write-Host "Review:      $($reviewMods.Count)" -ForegroundColor Yellow
-Write-Host "Suspicious:  $($suspiciousMods.Count)" -ForegroundColor DarkYellow
-Write-Host "High Risk:   $($highRiskMods.Count)" -ForegroundColor Red
-Write-Host "Unknown:     $($unknownMods.Count)" -ForegroundColor Magenta
-
-Write-Host ""
-Write-Host "IMPORTANT:"
-Write-Host "    This is static analysis only."
-Write-Host "    A detection is not proof of malware."
-Write-Host "    A clean result is not proof that a mod is safe."
-
-Show-Section "Analysis complete."
+Write-Host "Static analysis only. A clean result is not proof of safety."
