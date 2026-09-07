@@ -4,6 +4,10 @@ param(
 
 $ErrorActionPreference = "Stop"
 
+# ============================================================
+# PROX MOD ANALYZER
+# ============================================================
+
 function Show-Section {
     param([string]$Text)
 
@@ -16,12 +20,9 @@ function Show-Section {
 function Get-Hashes {
     param([string]$Path)
 
-    $sha256 = (Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash.ToLower()
-    $sha1   = (Get-FileHash -LiteralPath $Path -Algorithm SHA1).Hash.ToLower()
-
     return [PSCustomObject]@{
-        SHA256 = $sha256
-        SHA1   = $sha1
+        SHA256 = (Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash.ToLower()
+        SHA1   = (Get-FileHash -LiteralPath $Path -Algorithm SHA1).Hash.ToLower()
     }
 }
 
@@ -89,7 +90,10 @@ function Get-ZoneIdentifier {
     return $null
 }
 
+# These are indicators only.
+# Their presence does NOT prove malware.
 $Rules = [ordered]@{
+
     "Process execution" = @(
         "java/lang/ProcessBuilder",
         "Runtime.exec",
@@ -152,7 +156,12 @@ $HighRisk = @(
     "Invoke-Expression"
 )
 
+# ============================================================
+# FIND MODS FOLDER
+# ============================================================
+
 if (-not $ModsPath) {
+
     $defaultModsPath = Join-Path $env:APPDATA ".minecraft\mods"
 
     $ModsPath = Read-Host "Mods folder [$defaultModsPath]"
@@ -165,11 +174,20 @@ if (-not $ModsPath) {
 $ModsPath = [Environment]::ExpandEnvironmentVariables($ModsPath)
 
 if (-not (Test-Path -LiteralPath $ModsPath -PathType Container)) {
-    Write-Host "[!] Folder does not exist: $ModsPath" -ForegroundColor Red
+
+    Write-Host ""
+    Write-Host "[!] Folder does not exist:" -ForegroundColor Red
+    Write-Host "    $ModsPath"
+
     exit 1
 }
 
-$jars = @(Get-ChildItem -LiteralPath $ModsPath -Filter "*.jar" -File)
+$jars = @(
+    Get-ChildItem `
+        -LiteralPath $ModsPath `
+        -Filter "*.jar" `
+        -File
+)
 
 Clear-Host
 
@@ -179,146 +197,57 @@ Write-Host "Folder: $ModsPath"
 Write-Host "Mods found: $($jars.Count)"
 
 if ($jars.Count -eq 0) {
+
+    Write-Host ""
     Write-Host "[!] No JAR files found." -ForegroundColor Yellow
+
     exit 0
 }
 
+# ============================================================
+# RESULT STORAGE
+# ============================================================
+
+$verifiedMods = New-Object System.Collections.Generic.List[object]
+$reviewMods = New-Object System.Collections.Generic.List[object]
+$suspiciousMods = New-Object System.Collections.Generic.List[object]
+$highRiskMods = New-Object System.Collections.Generic.List[object]
+$unknownMods = New-Object System.Collections.Generic.List[object]
+
+# ============================================================
+# ANALYZE EACH MOD
+# ============================================================
+
 foreach ($jar in $jars) {
 
-    Show-Section "Analyzing: $($jar.Name)"
-
-    Write-Host "File size: $([math]::Round($jar.Length / 1MB, 2)) MB"
-
-    $hashes = Get-Hashes $jar.FullName
-
-    Write-Host ""
-    Write-Host "SHA-256: $($hashes.SHA256)"
-    Write-Host "SHA-1:   $($hashes.SHA1)"
-
-    $origin = Get-ZoneIdentifier $jar.FullName
-
-    if ($origin) {
-        Write-Host ""
-        Write-Host "[ORIGIN]"
-        Write-Host "    Host URL: $origin"
-    }
-
-    $score = 0
-
-    $reasons = New-Object System.Collections.Generic.List[string]
-    $found = @{}
-    $highHits = @{}
-
     try {
+
+        $hashes = Get-Hashes $jar.FullName
+
+        $modrinth = Get-ModrinthInfo $hashes.SHA1
+
+        $score = 0
+
+        $reasons = New-Object System.Collections.Generic.List[string]
+
+        $found = @{}
+
+        $highHits = @{}
+
+        $classCount = 0
+        $shortClassCount = 0
+
+        # --------------------------------------------------------
+        # OPEN JAR
+        # --------------------------------------------------------
 
         Add-Type -AssemblyName System.IO.Compression.FileSystem
 
         $zip = [IO.Compression.ZipFile]::OpenRead($jar.FullName)
 
-        Write-Host "[+] JAR structure: Valid"
-        Write-Host "[+] Files inside JAR: $($zip.Entries.Count)"
-
-        Show-Section "[MOD METADATA]"
-
-        $metadataFiles = @(
-            "fabric.mod.json",
-            "quilt.mod.json",
-            "META-INF/mods.toml",
-            "mcmod.info"
-        )
-
-        $metadata = @(
-            $zip.Entries |
-            Where-Object {
-                $_.FullName -in $metadataFiles
-            }
-        )
-
-        if ($metadata.Count -gt 0) {
-
-            foreach ($entry in $metadata) {
-
-                Write-Host "    [+] Found: $($entry.FullName)"
-
-                if ($entry.FullName -match "fabric|quilt") {
-
-                    try {
-
-                        $reader = New-Object IO.StreamReader($entry.Open())
-
-                        $text = $reader.ReadToEnd()
-
-                        $reader.Dispose()
-
-                        $json = $text | ConvertFrom-Json
-
-                        Write-Host "        Name:    $($json.name)"
-                        Write-Host "        Mod ID:  $($json.id)"
-                        Write-Host "        Version: $($json.version)"
-                    }
-                    catch {
-                    }
-                }
-            }
-
-        }
-        else {
-            Write-Host "    [i] No common mod metadata file found."
-        }
-
-        Show-Section "[MANIFEST]"
-
-        $manifest = $zip.GetEntry("META-INF/MANIFEST.MF")
-
-        if ($manifest) {
-
-            $reader = New-Object IO.StreamReader($manifest.Open())
-
-            $manifestText = $reader.ReadToEnd()
-
-            $reader.Dispose()
-
-            $entries = $manifestText -split "`r?`n" |
-                Where-Object {
-                    $_ -match "^(Main-Class|Premain-Class|Agent-Class):"
-                }
-
-            if ($entries) {
-
-                foreach ($line in $entries) {
-                    Write-Host "    [i] $line"
-                }
-
-            }
-            else {
-                Write-Host "    [+] No executable manifest entry."
-            }
-
-        }
-        else {
-            Write-Host "    [+] No manifest."
-        }
-
-        Show-Section "[EMBEDDED JARS]"
-
-        $embedded = @(
-            $zip.Entries |
-            Where-Object {
-                $_.FullName -match "\.jar$"
-            }
-        )
-
-        if ($embedded.Count -eq 0) {
-            Write-Host "    None found."
-        }
-        else {
-
-            foreach ($entry in $embedded) {
-                Write-Host "    $($entry.FullName)"
-            }
-        }
-
-        Show-Section "[STATIC INDICATORS]"
+        # --------------------------------------------------------
+        # COUNT CLASSES
+        # --------------------------------------------------------
 
         $classes = @(
             $zip.Entries |
@@ -327,48 +256,45 @@ foreach ($jar in $jars) {
             }
         )
 
-        Write-Host "    Java classes: $($classes.Count)"
+        $classCount = $classes.Count
 
-        $shortCount = @(
-            $classes |
-            ForEach-Object {
-                $name = $_.FullName -replace "\.class$", ""
-                ($name -split "/")[-1]
-            } |
-            Where-Object {
-                $_.Length -le 2
+        if ($classCount -gt 0) {
+
+            foreach ($class in $classes) {
+
+                $className = $class.FullName -replace "\.class$", ""
+
+                $simpleName = ($className -split "/")[-1]
+
+                if ($simpleName.Length -le 2) {
+                    $shortClassCount++
+                }
             }
-        ).Count
 
-        $ratio = if ($classes.Count -gt 0) {
-            $shortCount / $classes.Count
+            $ratio = $shortClassCount / $classCount
+
+            if ($ratio -ge 0.20) {
+
+                $score += 7
+
+                $reasons.Add(
+                    "High proportion of short class names"
+                )
+            }
         }
-        else {
-            0
-        }
 
-        if ($ratio -ge 0.20) {
-
-            Write-Host (
-                "    [!] High proportion of very short class names: " +
-                "$shortCount/$($classes.Count) " +
-                "($([math]::Round($ratio * 100, 1))%)"
-            ) -ForegroundColor Yellow
-
-            $score += 7
-            $reasons.Add("High proportion of short class names")
-
-        }
-        else {
-            Write-Host "    [+] Class names look relatively normal."
-        }
+        # --------------------------------------------------------
+        # SCAN FILE CONTENT
+        # --------------------------------------------------------
 
         foreach ($entry in $zip.Entries) {
 
-            if (
-                $entry.FullName.EndsWith("/") -or
-                $entry.Length -gt 10MB
-            ) {
+            if ($entry.FullName.EndsWith("/")) {
+                continue
+            }
+
+            # Skip huge files.
+            if ($entry.Length -gt 10MB) {
                 continue
             }
 
@@ -383,6 +309,10 @@ foreach ($jar in $jars) {
                 $text = $reader.ReadToEnd()
 
                 $reader.Dispose()
+
+                # --------------------------------------------
+                # NORMAL INDICATORS
+                # --------------------------------------------
 
                 foreach ($category in $Rules.Keys) {
 
@@ -400,12 +330,17 @@ foreach ($jar in $jars) {
                             }
 
                             if ($found[$category].Count -lt 8) {
+
                                 $found[$category] +=
                                     "$indicator -> $($entry.FullName)"
                             }
                         }
                     }
                 }
+
+                # --------------------------------------------
+                # HIGH-RISK INDICATORS
+                # --------------------------------------------
 
                 foreach ($indicator in $HighRisk) {
 
@@ -424,96 +359,70 @@ foreach ($jar in $jars) {
 
             }
             catch {
+                # Ignore unreadable entries.
             }
         }
 
-        foreach ($category in $Rules.Keys) {
+        $zip.Dispose()
 
-            if ($found.ContainsKey($category)) {
-
-                Write-Host "    [!] $category" -ForegroundColor Yellow
-
-                foreach ($hit in $found[$category]) {
-                    Write-Host "        $hit"
-                }
-
-            }
-            else {
-                Write-Host "    [+] $category`: Not detected"
-            }
-        }
-
-        Show-Section "[HIGH-RISK INDICATORS]"
-
-        if ($highHits.Count -eq 0) {
-
-            Write-Host "    None found."
-
-        }
-        else {
-
-            foreach ($hit in $highHits.Keys) {
-
-                Write-Host "    [!!!] $hit" -ForegroundColor Red
-
-                $score += 15
-            }
-
-            $reasons.Add("High-risk execution indicator(s)")
-        }
+        # ========================================================
+        # SCORE
+        # ========================================================
 
         if ($found.ContainsKey("Process execution")) {
+
             $score += 10
             $reasons.Add("Process execution capability")
         }
 
         if ($found.ContainsKey("Network communication")) {
+
             $score += 5
             $reasons.Add("Network communication capability")
         }
 
         if ($found.ContainsKey("Command shell")) {
+
             $score += 15
             $reasons.Add("Command shell capability")
         }
 
         if ($found.ContainsKey("PowerShell / web execution")) {
+
             $score += 20
-            $reasons.Add("PowerShell/web execution indicator")
+            $reasons.Add(
+                "PowerShell/web execution indicator"
+            )
         }
 
         if ($found.ContainsKey("File-system access")) {
+
             $score += 3
             $reasons.Add("File-system API usage")
         }
 
         if ($found.ContainsKey("Reflection")) {
+
             $score += 2
             $reasons.Add("Reflection API usage")
         }
 
+        if ($highHits.Count -gt 0) {
+
+            foreach ($hit in $highHits.Keys) {
+                $score += 15
+            }
+
+            $reasons.Add(
+                "High-risk execution indicator(s)"
+            )
+        }
+
         $score = [Math]::Min(100, $score)
 
-        Show-Section "[HASH REPUTATION (MODRINTH)]"
-
-        $modrinth = Get-ModrinthInfo $hashes.SHA1
-
-        if ($modrinth.Found) {
-
-            Write-Host "    [+] Exact SHA-1 match found on Modrinth." -ForegroundColor Green
-            Write-Host "        Project: $($modrinth.Name)"
-            Write-Host "        Mod ID:  $($modrinth.Slug)"
-            Write-Host "        Version: $($modrinth.Version)"
-            Write-Host "        Project ID: $($modrinth.ProjectID)"
-
-        }
-        else {
-
-            Write-Host "    [!] SHA-1 not found on Modrinth." -ForegroundColor Yellow
-            Write-Host "        This does NOT mean the mod is malicious."
-        }
-
-        Show-Section "RISK ASSESSMENT"
+        # ========================================================
+        # VERDICT
+        # ========================================================
 
         if ($score -le 10) {
             $verdict = "LOW RISK"
@@ -528,39 +437,288 @@ foreach ($jar in $jars) {
             $verdict = "HIGH RISK"
         }
 
-        Write-Host "Score:   $score/100"
-        Write-Host "Verdict: $verdict"
+        # ========================================================
+        # CLASSIFY MOD
+        # ========================================================
 
-        Write-Host ""
-        Write-Host "Reasons:"
+        $modName = $jar.BaseName
 
-        if ($reasons.Count -gt 0) {
+        if ($modrinth.Found) {
+            $modName = $modrinth.Name
+        }
 
-            $reasons |
-                Select-Object -Unique |
-                ForEach-Object {
-                    Write-Host "    - $_"
-                }
+        $result = [PSCustomObject]@{
+            Name     = $modName
+            File     = $jar.Name
+            SHA256   = $hashes.SHA256
+            SHA1     = $hashes.SHA1
+            Score    = $score
+            Verdict  = $verdict
+            Reasons  = $reasons
+            HighHits = $highHits.Keys
+            Modrinth = $modrinth
+            Origin   = Get-ZoneIdentifier $jar.FullName
+        }
 
+        # Exact Modrinth hash match is considered verified
+        # only when no suspicious static indicators were found.
+        if (
+            $modrinth.Found -and
+            $score -le 10
+        ) {
+
+            $verifiedMods.Add($result)
+        }
+        elseif ($score -le 25) {
+
+            $reviewMods.Add($result)
+        }
+        elseif ($score -le 45) {
+
+            $suspiciousMods.Add($result)
         }
         else {
-            Write-Host "    - No basic static indicators detected"
+
+            $highRiskMods.Add($result)
         }
-
-        Write-Host ""
-        Write-Host "IMPORTANT:"
-        Write-Host "    This is static analysis only."
-        Write-Host "    A capability is not proof of malware."
-        Write-Host "    A clean result is not proof that a mod is safe."
-
-        $zip.Dispose()
 
     }
     catch {
 
-        Write-Host "[!] Could not analyze archive: $($_.Exception.Message)" `
-            -ForegroundColor Red
+        $unknownMods.Add(
+            [PSCustomObject]@{
+                Name = $jar.BaseName
+                File = $jar.Name
+                Error = $_.Exception.Message
+            }
+        )
     }
 }
+
+# ============================================================
+# COMPACT RESULTS
+# ============================================================
+
+Clear-Host
+
+Show-Section "PROX MOD ANALYZER"
+
+Write-Host "Folder: $ModsPath"
+Write-Host "Mods found: $($jars.Count)"
+
+# ============================================================
+# VERIFIED
+# ============================================================
+
+Write-Host ""
+Write-Host "{ Verified Mods }" -ForegroundColor Green
+
+if ($verifiedMods.Count -eq 0) {
+
+    Write-Host "> None"
+}
+else {
+
+    foreach ($mod in $verifiedMods) {
+
+        Write-Host (
+            "> " +
+            $mod.Name.PadRight(30) +
+            $mod.File
+        )
+    }
+}
+
+# ============================================================
+# REVIEW
+# ============================================================
+
+Write-Host ""
+Write-Host "{ Review }" -ForegroundColor Yellow
+
+if ($reviewMods.Count -eq 0) {
+
+    Write-Host "> None"
+}
+else {
+
+    foreach ($mod in $reviewMods) {
+
+        Write-Host (
+            "> " +
+            $mod.Name.PadRight(30) +
+            "$($mod.File)  [$($mod.Score)/100]"
+        )
+    }
+}
+
+# ============================================================
+# SUSPICIOUS
+# ============================================================
+
+Write-Host ""
+Write-Host "{ Suspicious }" -ForegroundColor DarkYellow
+
+if ($suspiciousMods.Count -eq 0) {
+
+    Write-Host "> None"
+}
+else {
+
+    foreach ($mod in $suspiciousMods) {
+
+        Write-Host (
+            "> " +
+            $mod.Name.PadRight(30) +
+            "$($mod.File)  [$($mod.Score)/100]"
+        )
+    }
+}
+
+# ============================================================
+# HIGH RISK
+# ============================================================
+
+Write-Host ""
+Write-Host "{ High Risk }" -ForegroundColor Red
+
+if ($highRiskMods.Count -eq 0) {
+
+    Write-Host "> None"
+}
+else {
+
+    foreach ($mod in $highRiskMods) {
+
+        Write-Host (
+            "> " +
+            $mod.Name.PadRight(30) +
+            "$($mod.File)  [$($mod.Score)/100]"
+        )
+    }
+}
+
+# ============================================================
+# UNKNOWN
+# ============================================================
+
+Write-Host ""
+Write-Host "{ Unknown }" -ForegroundColor Magenta
+
+if ($unknownMods.Count -eq 0) {
+
+    Write-Host "> None"
+}
+else {
+
+    foreach ($mod in $unknownMods) {
+
+        Write-Host (
+            "> " +
+            $mod.Name.PadRight(30) +
+            $mod.File
+        )
+    }
+}
+
+# ============================================================
+# DETAILS FOR NON-VERIFIED MODS
+# ============================================================
+
+$needsDetails = @(
+    $reviewMods
+    $suspiciousMods
+    $highRiskMods
+    $unknownMods
+)
+
+if ($needsDetails.Count -gt 0) {
+
+    Show-Section "DETAILS"
+
+    foreach ($mod in $needsDetails) {
+
+        if (-not $mod.Score -and $unknownMods -contains $mod) {
+
+            Write-Host ""
+            Write-Host $mod.File -ForegroundColor Magenta
+            Write-Host "    [!] Analysis failed"
+            Write-Host "        $($mod.Error)"
+
+            continue
+        }
+
+        Write-Host ""
+        Write-Host $mod.File -ForegroundColor Yellow
+
+        Write-Host "    Score:   $($mod.Score)/100"
+        Write-Host "    Verdict: $($mod.Verdict)"
+
+        if ($mod.Reasons.Count -gt 0) {
+
+            Write-Host "    Reasons:"
+
+            $mod.Reasons |
+                Select-Object -Unique |
+                ForEach-Object {
+                    Write-Host "        - $_"
+                }
+        }
+
+        if ($mod.HighHits.Count -gt 0) {
+
+            Write-Host "    High-risk indicators:"
+
+            foreach ($hit in $mod.HighHits) {
+
+                Write-Host "        [!!!] $hit" `
+                    -ForegroundColor Red
+            }
+        }
+
+        Write-Host "    SHA-256: $($mod.SHA256)"
+        Write-Host "    SHA-1:   $($mod.SHA1)"
+
+        if ($mod.Modrinth.Found) {
+
+            Write-Host ""
+            Write-Host "    Modrinth:"
+            Write-Host "        Project: $($mod.Modrinth.Name)"
+            Write-Host "        Version: $($mod.Modrinth.Version)"
+        }
+        else {
+
+            Write-Host ""
+            Write-Host "    Modrinth:"
+            Write-Host "        No exact SHA-1 match found."
+        }
+
+        if ($mod.Origin) {
+
+            Write-Host ""
+            Write-Host "    Origin:"
+            Write-Host "        $($mod.Origin)"
+        }
+    }
+}
+
+# ============================================================
+# FINAL SUMMARY
+# ============================================================
+
+Show-Section "SUMMARY"
+
+Write-Host "Total:       $($jars.Count)"
+Write-Host "Verified:    $($verifiedMods.Count)" -ForegroundColor Green
+Write-Host "Review:      $($reviewMods.Count)" -ForegroundColor Yellow
+Write-Host "Suspicious:  $($suspiciousMods.Count)" -ForegroundColor DarkYellow
+Write-Host "High Risk:   $($highRiskMods.Count)" -ForegroundColor Red
+Write-Host "Unknown:     $($unknownMods.Count)" -ForegroundColor Magenta
+
+Write-Host ""
+Write-Host "IMPORTANT:"
+Write-Host "    This is static analysis only."
+Write-Host "    A detection is not proof of malware."
+Write-Host "    A clean result is not proof that a mod is safe."
 
 Show-Section "Analysis complete."
