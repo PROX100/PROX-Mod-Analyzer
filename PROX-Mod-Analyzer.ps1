@@ -1,213 +1,39 @@
 param([string]$ModsPath="")
-$ErrorActionPreference='Stop'
+$ErrorActionPreference='Continue'
 
-function Section([string]$t){
-    Write-Host "`n=========================================================="
-    Write-Host $t
-    Write-Host "=========================================================="
+function Section([string]$Text){Write-Host "`n==========================================================`n$Text`n=========================================================="}
+function Get-Hashes([string]$Path){[pscustomobject]@{SHA256=(Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash.ToLower();SHA1=(Get-FileHash -LiteralPath $Path -Algorithm SHA1).Hash.ToLower()}}
+function Get-Modrinth([string]$Sha1){try{$h=@{'User-Agent'='PROX-Mod-Analyzer/2.0'};$v=Invoke-RestMethod -UseBasicParsing -Uri "https://api.modrinth.com/v2/version_file/$Sha1" -Headers $h -TimeoutSec 8;if(-not $v){return [pscustomobject]@{Found=$false}};$pr=$null;if($v.project_id){$pr=Invoke-RestMethod -UseBasicParsing -Uri "https://api.modrinth.com/v2/project/$($v.project_id)" -Headers $h -TimeoutSec 8};[pscustomobject]@{Found=$true;Name=if($pr){$pr.title}else{'Unknown'};Slug=if($pr){$pr.slug}else{'Unknown'};Version=$v.version_number;ProjectID=$v.project_id}}catch{[pscustomobject]@{Found=$false}}}
+function Get-Zone([string]$Path){try{$x=Get-Content -LiteralPath $Path -Stream Zone.Identifier -ErrorAction Stop|Where-Object{$_ -like 'HostUrl=*'}|Select-Object -First 1;if($x){$x.Substring(8)}}catch{$null}}
+function Read-EntryText($Entry){if($Entry.Length -gt 8MB){return ''};try{$st=$Entry.Open();$ms=New-Object IO.MemoryStream;$st.CopyTo($ms);$st.Dispose();return [Text.Encoding]::UTF8.GetString($ms.ToArray())}catch{return ''}}
+
+# High-confidence cheat/client terms. These are used together with structural evidence.
+$CheatTerms=[ordered]@{
+ 'Combat automation'=@('AimAssist','Aimbot','TriggerBot','AutoClicker','AutoCrystal','AutoHitCrystal','AutoPot','AutoTotem','AutoArmor','AutoInventoryTotem','AutoWTap','CrystalOptimizer','ShieldDisabler','NoMissDelay','AnchorMacro','DoubleAnchor')
+ 'Movement/network manipulation'=@('Velocity','Fly','Speed','Flight','Freecam','PingSpoof','FakeLag','PacketFly','NoFall','Sprint','Blink','Timer','Packet')
+ 'Visual/player targeting'=@('PlayerESP','StorageEsp','TargetHud','NameTags','ESP','Tracers','XRay','Targeting','Hitboxes')
+ 'Client framework'=@('ClickGUI','ModuleManager','ModuleButton','FriendManager','ProfileManager','RotatorManager','RotationUtils','EventManager','PacketSendListener','PacketReceiveListener','MovementPacketListener')
+ 'Self-destruct/anti-analysis'=@('SelfDestruct','Self-Destruct','DestroyClient','UnloadModules','deleteSelf','deleteClient')
+}
+$NativeHigh=@('VirtualAlloc','CreateRemoteThread','WriteProcessMemory','OpenProcess','NtWriteVirtualMemory')
+$ShellTerms=@('cmd.exe','powershell.exe','pwsh','Invoke-Expression','DownloadString','DownloadFile','powershell -enc','powershell -encodedcommand')
+
+# Strong namespace/fingerprint examples observed in known cheat-client samples.
+$KnownNamespaces=@('dev/lvstrng/argon/','me/','cc/','client/modules/','module/modules/')
+$ExactKnown=@{
+ 'fd311430c688859bc867e739cddfe709cc8dea13'='Argon sample SHA-1'
+ 'fa3928b65ed2aa54e498567abdc31da3bc0d80249764e5c5d27de9d95449a66a'='Argon sample SHA-256'
 }
 
-function Hashes([string]$p){
-    [pscustomobject]@{
-        SHA256=(Get-FileHash -LiteralPath $p -Algorithm SHA256).Hash.ToLower()
-        SHA1=(Get-FileHash -LiteralPath $p -Algorithm SHA1).Hash.ToLower()
-    }
-}
-
-function Zone([string]$p){
-    try{
-        $x=Get-Content -LiteralPath $p -Stream Zone.Identifier -ErrorAction Stop |
-            Where-Object {$_ -like 'HostUrl=*'} |
-            Select-Object -First 1
-
-        if($x){
-            return $x.Substring(8)
-        }
-    }
-    catch{}
-
-    return $null
-}
-
-function Modrinth([string]$sha1){
-    try{
-        $headers=@{
-            'User-Agent'='PROX-Mod-Analyzer/1.0'
-        }
-
-        $v=Invoke-RestMethod `
-            -Uri "https://api.modrinth.com/v2/version_file/$sha1" `
-            -Headers $headers `
-            -TimeoutSec 8
-
-        if(-not $v){
-            return [pscustomobject]@{Found=$false}
-        }
-
-        $p=$null
-
-        if($v.project_id){
-            $p=Invoke-RestMethod `
-                -Uri "https://api.modrinth.com/v2/project/$($v.project_id)" `
-                -Headers $headers `
-                -TimeoutSec 8
-        }
-
-        return [pscustomobject]@{
-            Found=$true
-            Name=if($p){$p.title}else{'Unknown'}
-            Slug=if($p){$p.slug}else{'Unknown'}
-            Version=$v.version_number
-            ProjectID=$v.project_id
-        }
-    }
-    catch{
-        return [pscustomobject]@{Found=$false}
-    }
-}
-
-function ReadEntryText($entry){
-    $r=New-Object IO.StreamReader(
-        $entry.Open(),
-        [Text.Encoding]::UTF8,
-        $true
-    )
-
-    $t=$r.ReadToEnd()
-    $r.Dispose()
-
-    return $t
-}
-
-# ============================================================
-# CHEAT / RISK INDICATORS
-# ============================================================
-
-$CheatNames=@{
-
-    'Combat automation'=@(
-        'AimAssist',
-        'TriggerBot',
-        'AutoClicker',
-        'AutoCrystal',
-        'AutoHitCrystal',
-        'AutoPot',
-        'AutoPotRefill',
-        'AutoWTap',
-        'AutoJumpReset',
-        'AutoInventoryTotem',
-        'AutoDoubleHand',
-        'ShieldDisabler',
-        'TotemOffhand',
-        'CrystalOptimizer',
-        'AnchorMacro',
-        'DoubleAnchor',
-        'NoMissDelay'
-    )
-
-    'Movement/network manipulation'=@(
-        'PingSpoof',
-        'FakeLag',
-        'PackSpoof',
-        'Freecam',
-        'NoJumpDelay',
-        'NoBreakDelay',
-        'Sprint'
-    )
-
-    'ESP/targeting'=@(
-        'PlayerESP',
-        'StorageEsp',
-        'TargetHud',
-        'ClickGUI',
-        'HUD'
-    )
-
-    'Self-destruct/anti-analysis'=@(
-        'SelfDestruct',
-        'EncryptedString'
-    )
-}
-
-$SuspiciousClasses=@(
-    'MouseSimulation',
-    'RotationUtils',
-    'RotatorManager',
-    'PacketSendListener',
-    'PacketReceiveListener',
-    'MovementPacketListener',
-    'ClientConnectionMixin',
-    'KeyboardMixin',
-    'MouseMixin',
-    'ClientPlayerEntityMixin'
-)
-
-$NativeRisk=@(
-    'VirtualAlloc',
-    'CreateRemoteThread',
-    'WriteProcessMemory',
-    'OpenProcess',
-    'NtWriteVirtualMemory',
-    'JNI_OnLoad'
-)
-
-$ShellRisk=@(
-    'cmd.exe',
-    'powershell.exe',
-    'pwsh',
-    'Invoke-Expression',
-    'DownloadString',
-    'DownloadFile',
-    'ProcessBuilder.start',
-    'Runtime.exec'
-)
-
-# ============================================================
-# MODS PATH
-# ============================================================
-
-if(!$ModsPath){
-
-    $d=Join-Path $env:APPDATA '.minecraft\mods'
-
-    $ModsPath=Read-Host "Mods folder [$d]"
-
-    if([string]::IsNullOrWhiteSpace($ModsPath)){
-        $ModsPath=$d
-    }
-}
-
+if(-not $ModsPath){$d=Join-Path $env:APPDATA '.minecraft\mods';$ModsPath=Read-Host "Mods folder [$d]";if([string]::IsNullOrWhiteSpace($ModsPath)){$ModsPath=$d}}
 $ModsPath=[Environment]::ExpandEnvironmentVariables($ModsPath)
-
-if(!(Test-Path -LiteralPath $ModsPath -PathType Container)){
-
-    Write-Host "[!] Folder does not exist: $ModsPath" -ForegroundColor Red
-    exit 1
-}
-
-$jars=@(
-    Get-ChildItem `
-        -LiteralPath $ModsPath `
-        -Filter '*.jar' `
-        -File
-)
-
+if(-not(Test-Path -LiteralPath $ModsPath -PathType Container)){Write-Host "[!] Folder does not exist: $ModsPath" -ForegroundColor Red;exit 1}
+$jars=@(Get-ChildItem -LiteralPath $ModsPath -Filter '*.jar' -File)
 Clear-Host
-
-Section 'PROX MOD ANALYZER V5'
-
+Section 'PROX MOD ANALYZER V4'
 Write-Host "Folder: $ModsPath"
 Write-Host "Mods found: $($jars.Count)"
-
-if(!$jars.Count){
-
-    Write-Host '[!] No JAR files found.' -ForegroundColor Yellow
-    exit 0
-}
-
-# ============================================================
-# RESULT GROUPS
-# ============================================================
+if($jars.Count -eq 0){Write-Host '[!] No JAR files found.' -ForegroundColor Yellow;exit 0}
 
 $verified=New-Object System.Collections.Generic.List[object]
 $low=New-Object System.Collections.Generic.List[object]
@@ -216,819 +42,118 @@ $susp=New-Object System.Collections.Generic.List[object]
 $high=New-Object System.Collections.Generic.List[object]
 $unknown=New-Object System.Collections.Generic.List[object]
 
-# ============================================================
-# ANALYZE
-# ============================================================
-
 foreach($jar in $jars){
-
-    try{
-
-        $h=Hashes $jar.FullName
-        $mr=Modrinth $h.SHA1
-        $origin=Zone $jar.FullName
-
-        Add-Type -AssemblyName System.IO.Compression.FileSystem
-
-        $zip=[IO.Compression.ZipFile]::OpenRead($jar.FullName)
-
-        $entries=@($zip.Entries)
-
-        $names=@(
-            $entries |
-            ForEach-Object {$_.FullName}
-        )
-
-        $score=0
-
-        $reasons=New-Object System.Collections.Generic.List[string]
-
-        $evidence=New-Object System.Collections.Generic.List[string]
-
-        # ====================================================
-        # METADATA
-        # ====================================================
-
-        $meta=$null
-        $metaPath=$null
-
-        foreach($candidate in @(
-            'fabric.mod.json',
-            'quilt.mod.json'
-        )){
-
-            $x=$zip.GetEntry($candidate)
-
-            if($x){
-
-                $meta=$x
-                $metaPath=$candidate
-                break
-            }
-        }
-
-        $declaredId=$null
-        $declaredName=$null
-        $declaredVersion=$null
-
-        $entrypoints=@()
-        $mixins=@()
-
-        if($meta){
-
-            try{
-
-                $j=(ReadEntryText $meta) | ConvertFrom-Json
-
-                $declaredId=[string]$j.id
-                $declaredName=[string]$j.name
-                $declaredVersion=[string]$j.version
-
-                if($j.entrypoints){
-
-                    foreach($p in $j.entrypoints.PSObject.Properties.Value){
-
-                        foreach($ep in @($p)){
-
-                            if($ep -is [string]){
-
-                                $entrypoints += [string]$ep
-
-                            }
-                            elseif($ep.value){
-
-                                $entrypoints += [string]$ep.value
-                            }
-                        }
-                    }
-                }
-
-                if($j.mixins){
-
-                    $mixins=@(
-                        $j.mixins |
-                        ForEach-Object {[string]$_}
-                    )
-                }
-
-            }
-            catch{}
-        }
-
-        # ====================================================
-        # CLASS INFORMATION
-        # ====================================================
-
-        $classEntries=@(
-            $entries |
-            Where-Object {
-                $_.FullName -match '\.class$'
-            }
-        )
-
-        $classPaths=@(
-            $classEntries |
-            ForEach-Object {
-                $_.FullName
-            }
-        )
-
-        $classCount=$classEntries.Count
-
-        $short=0
-
-        foreach($c in $classPaths){
-
-            $n=(
-                ($c -replace '\.class$','') -split '/'
-            )[-1]
-
-            if($n.Length -le 2){
-                $short++
-            }
-        }
-
-        $shortRatio=if($classCount){
-            $short/$classCount
-        }
-        else{
-            0
-        }
-
-        if($shortRatio -ge .20){
-
-            $score+=7
-
-            $reasons.Add(
-                'High proportion of short class names'
-            )
-        }
-
-        # ====================================================
-        # CONTENT SCAN
-        # ====================================================
-
-        $cheatHits=@{}
-        $capHits=@{}
-        $riskHits=@{}
-
-        foreach($cat in $CheatNames.Keys){
-
-            $cheatHits[$cat]=
-                New-Object System.Collections.Generic.List[string]
-        }
-
-        $capHits['Suspicious framework']=
-            New-Object System.Collections.Generic.List[string]
-
-        foreach($e in $entries){
-
-            if(
-                $e.FullName.EndsWith('/') -or
-                $e.Length -gt 15MB
-            ){
-                continue
-            }
-
-            $text=''
-
-            try{
-
-                $text=ReadEntryText $e
-
-            }
-            catch{
-
-                continue
-            }
-
-            # ------------------------------------------------
-            # Cheat categories
-            # ------------------------------------------------
-
-            foreach($cat in $CheatNames.Keys){
-
-                foreach($term in $CheatNames[$cat]){
-
-                    if(
-                        $text.IndexOf(
-                            $term,
-                            [StringComparison]::OrdinalIgnoreCase
-                        ) -ge 0
-                    ){
-
-                        if(
-                            $cheatHits[$cat].Count -lt 12
-                        ){
-
-                            $cheatHits[$cat].Add(
-                                "$term -> $($e.FullName)"
-                            )
-                        }
-                    }
-                }
-            }
-
-            # ------------------------------------------------
-            # Framework indicators
-            # ------------------------------------------------
-
-            foreach($term in $SuspiciousClasses){
-
-                if(
-                    $text.IndexOf(
-                        $term,
-                        [StringComparison]::OrdinalIgnoreCase
-                    ) -ge 0
-                ){
-
-                    if(
-                        $capHits['Suspicious framework'].Count -lt 20
-                    ){
-
-                        $capHits['Suspicious framework'].Add(
-                            "$term -> $($e.FullName)"
-                        )
-                    }
-                }
-            }
-
-            # ------------------------------------------------
-            # Native indicators
-            # ------------------------------------------------
-
-            foreach($term in $NativeRisk){
-
-                if(
-                    $text.IndexOf(
-                        $term,
-                        [StringComparison]::OrdinalIgnoreCase
-                    ) -ge 0
-                ){
-
-                    $riskHits[
-                        "$term -> $($e.FullName)"
-                    ]=1
-                }
-            }
-
-            # ------------------------------------------------
-            # Shell indicators
-            # ------------------------------------------------
-
-            foreach($term in $ShellRisk){
-
-                if(
-                    $text.IndexOf(
-                        $term,
-                        [StringComparison]::OrdinalIgnoreCase
-                    ) -ge 0
-                ){
-
-                    $riskHits[
-                        "$term -> $($e.FullName)"
-                    ]=1
-                }
-            }
-        }
-
-        # ====================================================
-        # CLASS NAME SCAN
-        # ====================================================
-
-        foreach($path in $classPaths){
-
-            $simpleClass=[
-                IO.Path
-            ]::GetFileNameWithoutExtension($path)
-
-            foreach($cat in $CheatNames.Keys){
-
-                foreach($term in $CheatNames[$cat]){
-
-                    if(
-                        $simpleClass.IndexOf(
-                            $term,
-                            [StringComparison]::OrdinalIgnoreCase
-                        ) -ge 0
-                    ){
-
-                        if(
-                            $cheatHits[$cat].Count -lt 12
-                        ){
-
-                            $cheatHits[$cat].Add(
-                                "CLASS NAME: $path"
-                            )
-                        }
-                    }
-                }
-            }
-        }
-
-        # ====================================================
-        # CHEAT ARCHITECTURE
-        # ====================================================
-
-        $cheatCategories=0
-
-        foreach($cat in $cheatHits.Keys){
-
-            if($cheatHits[$cat].Count -gt 0){
-
-                $cheatCategories++
-
-                $evidence.Add(
-                    "${cat}: $($cheatHits[$cat].Count) indicator(s)"
-                )
-            }
-        }
-
-        if($cheatCategories -eq 1){
-
-            $score+=20
-
-            $reasons.Add(
-                'Cheat-client feature indicators'
-            )
-        }
-        elseif($cheatCategories -eq 2){
-
-            $score+=40
-
-            $reasons.Add(
-                'Multiple cheat-client feature categories'
-            )
-        }
-        elseif($cheatCategories -ge 3){
-
-            $score+=65
-
-            $reasons.Add(
-                'Strong multi-category cheat-client fingerprint'
-            )
-        }
-
-        # ====================================================
-        # FRAMEWORK
-        # ====================================================
-
-        if(
-            $capHits['Suspicious framework'].Count -ge 2
-        ){
-
-            $score+=10
-
-            $reasons.Add(
-                'Client automation/packet framework indicators'
-            )
-
-            foreach(
-                $item in
-                $capHits['Suspicious framework'] |
-                Select-Object -First 8
-            ){
-
-                $evidence.Add($item)
-            }
-        }
-
-        # ====================================================
-        # HIGH RISK
-        # ====================================================
-
-        if($riskHits.Count -gt 0){
-
-            $score+=25
-
-            $reasons.Add(
-                'High-risk execution indicator(s)'
-            )
-
-            foreach($item in $riskHits.Keys | Select-Object -First 10){
-
-                $evidence.Add($item)
-            }
-        }
-
-        # ====================================================
-        # PACKAGE NAMESPACE ANALYSIS
-        # ====================================================
-
-        $packageHints=@()
-
-        foreach($p in $classPaths){
-
-            if($p -match '^([^/]+/[^/]+)/'){
-
-                $packageHints += $Matches[1]
-            }
-        }
-
-        $distinctHints=@(
-            $packageHints |
-            Select-Object -Unique
-        )
-
-        $mismatchCount=0
-
-        if($declaredId){
-
-            foreach($hint in $distinctHints){
-
-                $normalized=
-                    $hint.Replace('/','').
-                    Replace('_','').
-                    Replace('-','').
-                    ToLower()
-
-                $idnorm=
-                    $declaredId.Replace('_','').
-                    Replace('-','').
-                    ToLower()
-
-                if(
-                    $normalized -notmatch [regex]::Escape($idnorm) -and
-                    $normalized.Length -gt 5
-                ){
-
-                    $mismatchCount++
-                }
-            }
-        }
-
-        if($mismatchCount -ge 2){
-
-            $score+=20
-
-            $reasons.Add(
-                'Declared mod identity does not match code namespace'
-            )
-
-            $sampleNamespace=
-                if($distinctHints.Count -gt 0){
-                    $distinctHints[0]
-                }
-                else{
-                    'unknown'
-                }
-
-            $evidence.Add(
-                "Namespace mismatch: declared '$declaredId' vs code package '$sampleNamespace'"
-            )
-        }
-
-        # ====================================================
-        # ENTRYPOINT ANALYSIS
-        # ====================================================
-
-        if(
-            $declaredId -and
-            $entrypoints.Count -gt 0
-        ){
-
-            foreach($ep in $entrypoints){
-
-                $epNorm=$ep.ToLower()
-
-                if(
-                    $declaredId.ToLower() -notmatch
-                    ($epNorm -replace '\..*$','') -and
-                    $epNorm -match
-                    'argon|cheat|hack|client|clickgui|module'
-                ){
-
-                    $score+=25
-
-                    $reasons.Add(
-                        'Suspicious entrypoint identity mismatch'
-                    )
-
-                    $evidence.Add(
-                        "Entrypoint: $ep"
-                    )
-                }
-            }
-        }
-
-        # ====================================================
-        # MIXIN SURFACE
-        # ====================================================
-
-        $mixinHits=@(
-            $mixins |
-            Where-Object {
-                $_ -match
-                '(?i)mouse|keyboard|connection|player|camera|interaction|inventory|packet'
-            }
-        )
-
-        if(
-            $mixinHits.Count -ge 3 -and
-            $cheatCategories -ge 1
-        ){
-
-            $score+=15
-
-            $reasons.Add(
-                'Cheat-related client mixin surface'
-            )
-
-            foreach(
-                $m in $mixinHits |
-                Select-Object -First 8
-            ){
-
-                $evidence.Add(
-                    "Mixin: $m"
-                )
-            }
-        }
-
-        # ====================================================
-        # ARGON NAMESPACE
-        # ====================================================
-
-        $argonHints=@(
-            $classPaths |
-            Where-Object {
-                $_ -match '(?i)lvstrng/argon|argon/'
-            }
-        )
-
-        $argonFiles=@(
-            $names |
-            Where-Object {
-                $_ -match '(?i)argon'
-            }
-        )
-
-        if($argonHints.Count -ge 2){
-
-            $score+=60
-
-            $reasons.Add(
-                'Argon-family code namespace detected'
-            )
-
-            $evidence.Add(
-                "Argon namespace classes: $($argonHints.Count)"
-            )
-        }
-
-        if($argonFiles.Count -ge 2){
-
-            $score+=10
-
-            $reasons.Add(
-                'Argon-related archive artifacts detected'
-            )
-        }
-
-        # ====================================================
-        # FINAL SCORE
-        # ====================================================
-
-        $score=[Math]::Min(
-            100,
-            $score
-        )
-
-        if($score -ge 75){
-
-            $verdict='HIGH RISK'
-
-        }
-        elseif($score -ge 45){
-
-            $verdict='SUSPICIOUS'
-
-        }
-        elseif($score -ge 20){
-
-            $verdict='REVIEW'
-
-        }
-        else{
-
-            $verdict='LOW RISK'
-        }
-
-        # ====================================================
-        # NAME
-        # ====================================================
-
-        $name=
-            if($mr.Found){
-                $mr.Name
-            }
-            elseif($declaredName){
-                $declaredName
-            }
-            else{
-                $jar.BaseName
-            }
-
-        $result=[pscustomobject]@{
-            Name=$name
-            File=$jar.Name
-            SHA256=$h.SHA256
-            SHA1=$h.SHA1
-            Score=$score
-            Verdict=$verdict
-            Reasons=$reasons
-            Evidence=$evidence
-            Modrinth=$mr
-            Origin=$origin
-            ClassCount=$classCount
-        }
-
-        # ====================================================
-        # CLASSIFICATION
-        # ====================================================
-
-        if(
-            $mr.Found -and
-            $score -lt 20
-        ){
-
-            $verified.Add($result)
-
-        }
-        elseif($score -lt 10){
-
-            $low.Add($result)
-
-        }
-        elseif($score -lt 45){
-
-            $review.Add($result)
-
-        }
-        elseif($score -lt 75){
-
-            $susp.Add($result)
-
-        }
-        else{
-
-            $high.Add($result)
-        }
-
-        $zip.Dispose()
-
-    }
-    catch{
-
-        $unknown.Add(
-            [pscustomobject]@{
-                Name=$jar.BaseName
-                File=$jar.Name
-                Error=$_.Exception.Message
-            }
-        )
-    }
+ try{
+  $hh=Get-Hashes $jar.FullName
+  $mr=Get-Modrinth $hh.SHA1
+  $score=0;$reasons=New-Object System.Collections.Generic.List[string];$evidence=New-Object System.Collections.Generic.List[string]
+  $termHits=@{};$classHits=@();$entryNames=@()
+  Add-Type -AssemblyName System.IO.Compression.FileSystem
+  $zip=[IO.Compression.ZipFile]::OpenRead($jar.FullName)
+  $entryNames=@($zip.Entries|ForEach-Object{$_.FullName})
+
+  # Exact known sample fingerprint. This is intentionally independent of Modrinth reputation.
+  if($ExactKnown.ContainsKey($hh.SHA1) -or $ExactKnown.ContainsKey($hh.SHA256)){
+   $score=100;$reasons.Add('Exact known cheat-client fingerprint match');$evidence.Add('Known sample fingerprint matched')
+  }
+
+  # Namespace / package structure.
+  $allNames=($entryNames -join "`n")
+  foreach($ns in $KnownNamespaces){$c=([regex]::Matches($allNames,[regex]::Escape($ns),'IgnoreCase')).Count;if($c -ge 5 -and $ns -ne 'me/'){ $score+=10;$reasons.Add("Suspicious client namespace structure");$evidence.Add("Namespace pattern: $ns ($c entries)") }}
+
+  # Class-name evidence. Names are much more useful than scanning every resource byte.
+  $classes=@($zip.Entries|Where-Object{$_.FullName -match '\.class$'})
+  $classCount=$classes.Count
+  foreach($cat in $CheatTerms.Keys){
+   $hits=New-Object System.Collections.Generic.List[string]
+   foreach($term in $CheatTerms[$cat]){
+    $m=$classes|Where-Object{$_.FullName -match ("(?i)(^|/|\$)"+[regex]::Escape($term)+"(\$|\.class$)")}
+    if($m){foreach($x in $m){if($hits.Count -lt 12){$hits.Add("$term -> $($x.FullName)")}}}
+   }
+   if($hits.Count -gt 0){$termHits[$cat]=$hits}
+  }
+
+  # Count strong cheat-feature classes.
+  $combatCount=0;$movementCount=0;$renderCount=0;$selfCount=0;$frameworkCount=0
+  if($termHits.ContainsKey('Combat automation')){$combatCount=$termHits['Combat automation'].Count; $score += [Math]::Min(30,[Math]::Max(10,$combatCount*5)); $reasons.Add('Cheat-specific combat modules')}
+  if($termHits.ContainsKey('Movement/network manipulation')){$movementCount=$termHits['Movement/network manipulation'].Count;$score += [Math]::Min(25,[Math]::Max(5,$movementCount*3));$reasons.Add('Movement/network manipulation modules')}
+  if($termHits.ContainsKey('Visual/player targeting')){$renderCount=$termHits['Visual/player targeting'].Count;$score += [Math]::Min(15,[Math]::Max(4,$renderCount*2));$reasons.Add('ESP/targeting modules')}
+  if($termHits.ContainsKey('Self-destruct/anti-analysis')){$selfCount=$termHits['Self-destruct/anti-analysis'].Count;$score += 20;$reasons.Add('Self-destruct/anti-analysis feature')}
+  if($termHits.ContainsKey('Client framework')){$frameworkCount=$termHits['Client framework'].Count;$score += [Math]::Min(15,[Math]::Max(3,$frameworkCount*2));$reasons.Add('Cheat-client framework structure')}
+
+  # Strong correlation bonus: several independent cheat categories together.
+  $cats=($termHits.Keys|Where-Object{$_ -in @('Combat automation','Movement/network manipulation','Visual/player targeting','Self-destruct/anti-analysis')}).Count
+  if($cats -ge 3){$score+=20;$reasons.Add('Multiple independent cheat-client capability groups')}
+  if($cats -ge 4){$score+=15;$reasons.Add('Very strong multi-category cheat-client fingerprint')}
+
+  # Byte/string indicators, capped and given low weight unless shell/native APIs appear.
+  $shellFound=$false;$nativeFound=$false;$networkFound=$false;$reflectionFound=$false
+  foreach($entry in $zip.Entries){if($entry.FullName.EndsWith('/')){continue};$txt=Read-EntryText $entry;if(-not $txt){continue}
+   foreach($t in $ShellTerms){if($txt.IndexOf($t,[StringComparison]::OrdinalIgnoreCase)-ge 0){$shellFound=$true}}
+   foreach($t in $NativeHigh){if($txt.IndexOf($t,[StringComparison]::OrdinalIgnoreCase)-ge 0){$nativeFound=$true}}
+   if($txt.IndexOf('java/net/Socket',[StringComparison]::OrdinalIgnoreCase)-ge 0 -or $txt.IndexOf('java/net/HttpURLConnection',[StringComparison]::OrdinalIgnoreCase)-ge 0){$networkFound=$true}
+   if($txt.IndexOf('java/lang/reflect',[StringComparison]::OrdinalIgnoreCase)-ge 0){$reflectionFound=$true}
+  }
+  if($shellFound){$score+=15;$reasons.Add('Shell/script execution indicator')}
+  if($nativeFound){$score+=30;$reasons.Add('Native process-memory indicator')}
+  if($networkFound -and $cats -ge 2){$score+=5;$reasons.Add('Network capability combined with cheat features')}
+  if($reflectionFound -and $cats -ge 2){$score+=3;$reasons.Add('Reflection combined with cheat features')}
+
+  # Short class names are only a weak supporting signal.
+  $short=0
+  foreach($c in $classes){$n=(($c.FullName-replace '\.class$','')-split '/')[-1];if($n.Length -le 2){$short++}}
+  if($classCount -gt 0 -and ($short/$classCount) -ge .20){$score+=5;$reasons.Add('High proportion of short class names')}
+
+  $score=[Math]::Min(100,$score)
+  if($score -ge 75){$verdict='HIGH RISK'}elseif($score -ge 45){$verdict='SUSPICIOUS'}elseif($score -ge 15){$verdict='REVIEW'}else{$verdict='LOW RISK'}
+
+  $name=if($mr.Found){$mr.Name}else{$jar.BaseName}
+  $r=[pscustomobject]@{Name=$name;File=$jar.Name;SHA256=$hh.SHA256;SHA1=$hh.SHA1;Score=$score;Verdict=$verdict;Reasons=$reasons|Select-Object -Unique;Evidence=$evidence;Terms=$termHits;Modrinth=$mr;Origin=Get-Zone $jar.FullName;ClassCount=$classCount}
+
+  # Important: reputation no longer overrides strong behavioral evidence.
+  if($mr.Found -and $score -lt 15){$verified.Add($r)}
+  elseif($score -lt 15){$low.Add($r)}
+  elseif($score -lt 45){$review.Add($r)}
+  elseif($score -lt 75){$susp.Add($r)}
+  else{$high.Add($r)}
+  
+  if($zip){$zip.Dispose()}
+ }catch{
+  $unknown.Add([pscustomobject]@{Name=$jar.BaseName;File=$jar.Name;Error=$_.Exception.Message})
+ }
 }
 
-# ============================================================
-# RESULTS
-# ============================================================
-
 Clear-Host
-
-Section 'PROX MOD ANALYZER V5'
-
+Section 'PROX MOD ANALYZER V4'
 Write-Host "Folder: $ModsPath"
 Write-Host "Mods found: $($jars.Count)"
 
-function PrintGroup(
-    $title,
-    $items,
-    $color,
-    [bool]$showScore
-){
+function Print-Group($Title,$Items,$Color){Write-Host "`n{ $Title }" -ForegroundColor $Color;if($Items.Count -eq 0){Write-Host '> None';return};foreach($m in $Items){Write-Host ("> "+$m.Name.PadRight(30)+$m.File+"  ["+$m.Score+"/100]")}}
 
-    Write-Host ""
-    Write-Host "{ $title }" -ForegroundColor $color
+Print-Group 'Verified Mods' $verified Green
+Print-Group 'Low Risk' $low DarkGreen
+Print-Group 'Review' $review Yellow
+Print-Group 'Suspicious' $susp DarkYellow
+Print-Group 'High Risk' $high Red
+Print-Group 'Unknown' $unknown Magenta
 
-    if($items.Count -eq 0){
-
-        Write-Host "> None"
-
-    }
-    else{
-
-        foreach($m in $items){
-
-            $suffix=
-                if($showScore){
-                    "  [$($m.Score)/100]"
-                }
-                else{
-                    ""
-                }
-
-            Write-Host (
-                "> " +
-                $m.Name.PadRight(30) +
-                $m.File +
-                $suffix
-            )
-        }
-    }
+$flagged=@($review+$susp+$high)
+if($flagged.Count -gt 0 -or $unknown.Count -gt 0){
+ Section 'FLAGGED DETAILS'
+ foreach($m in $flagged){Write-Host "`n$m.File" -ForegroundColor Yellow;Write-Host "    Score: $($m.Score)/100";Write-Host "    Verdict: $($m.Verdict)";Write-Host '    Reasons:';foreach($x in $m.Reasons){Write-Host "        - $x"};if($m.Evidence.Count){Write-Host '    Evidence:';foreach($x in $m.Evidence){Write-Host "        - $x"}};foreach($cat in $m.Terms.Keys){Write-Host "    $cat`:";foreach($x in $m.Terms[$cat]){Write-Host "        $x"}};Write-Host "    SHA-256: $($m.SHA256)";Write-Host "    SHA-1:   $($m.SHA1)";if($m.Modrinth.Found){Write-Host "    Modrinth: $($m.Modrinth.Name) $($m.Modrinth.Version)"}else{Write-Host '    Modrinth: no exact hash match'}}
+ foreach($m in $unknown){Write-Host "`n$m.File" -ForegroundColor Magenta;Write-Host "    [!] Analysis failed: $($m.Error)"}
 }
-
-PrintGroup 'Verified Mods' $verified Green $true
-PrintGroup 'Low Risk' $low Gray $true
-PrintGroup 'Review' $review Yellow $true
-PrintGroup 'Suspicious' $susp DarkYellow $true
-PrintGroup 'High Risk' $high Red $true
-PrintGroup 'Unknown' $unknown Magenta $false
-
-# ============================================================
-# FLAGGED DETAILS
-# ============================================================
-
-$flagged=@(
-    $review +
-    $susp +
-    $high
-)
-
-if($flagged.Count -gt 0){
-
-    Section 'FLAGGED DETAILS'
-
-    foreach($m in $flagged){
-
-        Write-Host ""
-        Write-Host $m.File -ForegroundColor Yellow
-
-        Write-Host "    Score:   $($m.Score)/100"
-        Write-Host "    Verdict: $($m.Verdict)"
-
-        if($m.Reasons.Count){
-
-            Write-Host "    Reasons:"
-
-            $m.Reasons |
-                Select-Object -Unique |
-                ForEach-Object {
-                    Write-Host "        - $_"
-                }
-        }
-
-        if($m.Evidence.Count){
-
-            Write-Host "    Evidence:"
-
-            $m.Evidence |
-                Select-Object -First 15 |
-                ForEach-Object {
-                    Write-Host "        $_"
-                }
-        }
-
-        Write-Host "    SHA-256: $($m.SHA256)"
-        Write-Host "    SHA-1:   $($m.SHA1)"
-
-        if($m.Modrinth.Found){
-
-            Write-Host (
-                "    Modrinth: $($m.Modrinth.Name) " +
-                "$($m.Modrinth.Version)"
-            )
-
-        }
-        else{
-
-            Write-Host "    Modrinth: No exact SHA-1 match"
-        }
-
-        if($m.Origin){
-
-            Write-Host "    Origin:   $($m.Origin)"
-        }
-    }
-}
-
-# ============================================================
-# SUMMARY
-# ============================================================
 
 Section 'SUMMARY'
-
 Write-Host "Total:       $($jars.Count)"
 Write-Host "Verified:    $($verified.Count)" -ForegroundColor Green
-Write-Host "Low Risk:    $($low.Count)"
+Write-Host "Low Risk:    $($low.Count)" -ForegroundColor DarkGreen
 Write-Host "Review:      $($review.Count)" -ForegroundColor Yellow
 Write-Host "Suspicious:  $($susp.Count)" -ForegroundColor DarkYellow
 Write-Host "High Risk:   $($high.Count)" -ForegroundColor Red
 Write-Host "Unknown:     $($unknown.Count)" -ForegroundColor Magenta
-
-Write-Host ""
-Write-Host "IMPORTANT:"
-Write-Host "    Static analysis and reputation checks provide evidence,"
-Write-Host "    but cannot guarantee detection of every future or obfuscated threat."
-
+Write-Host "`nIMPORTANT:"
+Write-Host '    This tool performs static analysis and reputation checks.'
+Write-Host '    Exact reputation matches identify the file; they do not override behavioral evidence.'
+Write-Host '    No static scanner can guarantee detection of every future or heavily obfuscated threat.'
 Section 'Analysis complete.'
