@@ -1,4 +1,4 @@
-
+param(
     [string]$ModsPath = ""
 )
 
